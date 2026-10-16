@@ -1,0 +1,221 @@
+name: build
+on: [push, workflow_dispatch]
+
+# 产物：Emberkeeper-mod.zip
+# 解压后得到 mods/BaseLib + mods/Emberkeeper，一起丢进游戏 mods/ 即可。
+
+jobs:
+  b:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: 解压 + 版本校验
+        run: |
+          mkdir -p s
+          echo "=== zip 校验码 ==="
+          md5sum Emberkeeper.zip
+          unzip -o -q Emberkeeper.zip -d s
+          if [ -f s/Emberkeeper/Emberkeeper.csproj ]; then R=s/Emberkeeper
+          elif [ -f s/Emberkeeper.csproj ]; then R=s
+          else R=$(dirname "$(find s -name 'Emberkeeper.csproj' | head -1)"); fi
+          echo "R=$R" >> $GITHUB_ENV
+          echo "源码根：$R"
+          grep -n "UseCustomArt = " "$R/Code/Characters/EmberkeeperCharacter.cs"
+          echo "贴图数量: $(find "$R/Emberkeeper/images" -type f | wc -l)"
+          echo "预设名: $(grep -h '^name=' "$R/export_presets.cfg" | tr '\n' ' ')"
+
+      - name: 还原依赖
+        run: |
+          cd "$R"
+          dotnet restore -p:UseRefLib=true 2>&1 | tail -8
+
+      - name: 探测 API 签名
+        id: probe
+        continue-on-error: true
+        run: |
+          cd "$R/tools/probe"
+          dotnet run -c Release 2>&1 | tail -60
+
+      - name: 编译
+        id: build
+        continue-on-error: true
+        run: |
+          cd "$R"
+          echo "=== build ===" > /tmp/log.txt
+          dotnet build -c Release --no-restore -p:UseRefLib=true >> /tmp/log.txt 2>&1
+          echo "build exit=$?" >> /tmp/log.txt
+          grep -E "error" /tmp/log.txt | sort -u | head -60 || echo "(无错误)"
+
+      - name: 导出 PCK
+        id: pck
+        continue-on-error: true
+        run: |
+          set +e
+          cd "$R"
+          mkdir -p out/mods/Emberkeeper
+          DLL=$(find . -name "Emberkeeper.dll" -not -path "*/obj/*" | head -1)
+          if [ -n "$DLL" ]; then cp "$DLL" out/mods/Emberkeeper/; cp Emberkeeper.json out/mods/Emberkeeper/; fi
+
+          # ── 找 Godot：多个候选 URL，glob 定位可执行文件 ──
+          mkdir -p /tmp/gd && cd /tmp/gd
+          GODOT=""
+          for URL in \
+            "https://github.com/godotengine/godot/releases/download/4.5.1-stable/Godot_v4.5.1-stable_linux.x86_64.zip" \
+            "https://github.com/godotengine/godot/releases/download/4.5.1-stable/Godot_v4.5.1-stable_linux_x86_64.zip" \
+            "https://github.com/godotengine/godot/releases/download/4.5-stable/Godot_v4.5-stable_linux.x86_64.zip" \
+            "https://github.com/godotengine/godot/releases/download/4.4.1-stable/Godot_v4.4.1-stable_linux.x86_64.zip" ; do
+            echo "--- 尝试: $URL"
+            rm -f g.zip
+            curl -sSL --max-time 180 -o g.zip "$URL" || continue
+            SZ=$(stat -c%s g.zip 2>/dev/null || echo 0)
+            echo "    下载 $SZ 字节"
+            if [ "$SZ" -lt 1000000 ]; then echo "    太小，跳过"; continue; fi
+            unzip -q -o g.zip || { echo "    解压失败"; continue; }
+            # glob 找可执行文件（不猜名字）
+            CAND=$(find . -maxdepth 1 -type f \( -iname "Godot*" -o -iname "godot*" \) ! -name "*.zip" | head -1)
+            if [ -n "$CAND" ]; then
+              chmod +x "$CAND"
+              GODOT="$(pwd)/$CAND"
+              echo "    ✔ 找到 Godot: $GODOT"
+              break
+            fi
+          done
+
+          if [ -z "$GODOT" ]; then
+            echo "!!!!!! 所有 Godot 下载地址都失败 !!!!!!"
+          else
+            echo "=== Godot 版本 ==="
+            "$GODOT" --headless --version 2>&1 | head -3
+          fi
+
+          cd "$R"
+          # 藏起所有含 .cs 的目录
+          mkdir -p .h
+          [ -d Code ] && mv Code .h/Code
+          [ -d tools ] && mv tools .h/tools
+          [ -f Emberkeeper.csproj ] && mv Emberkeeper.csproj .h/
+
+          PCK_MADE=0
+          if [ -n "$GODOT" ]; then
+            echo "=== Godot 导入 ==="
+            "$GODOT" --headless --path . --import > /tmp/import.log 2>&1
+            echo "导入退出码: $?"
+            tail -25 /tmp/import.log
+            echo "=== .godot 缓存 ==="
+            ls -la .godot 2>/dev/null | head -6 || echo "(无 .godot)"
+
+            for PRESET in BasicExport CustomExport MinimalExport; do
+              echo ""
+              echo "########## 预设: $PRESET ##########"
+              rm -f Emberkeeper.pck
+              "$GODOT" --headless --path . --export-pack "$PRESET" Emberkeeper.pck > /tmp/exp.log 2>&1
+              echo "退出码: $?"
+              tail -25 /tmp/exp.log
+              if [ -f Emberkeeper.pck ] && [ -s Emberkeeper.pck ]; then
+                echo "✔ 成功：$PRESET"; ls -lh Emberkeeper.pck; PCK_MADE=1; break
+              else
+                echo "✘ 失败：$PRESET"
+              fi
+            done
+          fi
+
+          # 还原
+          [ -d .h/Code ] && mv .h/Code Code
+          [ -d .h/tools ] && mv .h/tools tools
+          [ -f .h/Emberkeeper.csproj ] && mv .h/Emberkeeper.csproj Emberkeeper.csproj
+
+          echo ""
+          echo "########## PCK 结果 ##########"
+          if [ "$PCK_MADE" = "1" ]; then
+            cp Emberkeeper.pck out/mods/Emberkeeper/
+            echo "PCK OK → 完整版（自定义贴图）"
+          else
+            echo "PCK 失败 → 改用原版美术重编译（has_pck=false）"
+            sed -i 's/UseCustomArt = true/UseCustomArt = false/' Code/Characters/EmberkeeperCharacter.cs
+            grep -n "UseCustomArt = " Code/Characters/EmberkeeperCharacter.cs
+            dotnet build -c Release --no-restore -p:UseRefLib=true 2>&1 | tail -10
+            DLL2=$(find . -name "Emberkeeper.dll" -not -path "*/obj/*" | head -1)
+            [ -n "$DLL2" ] && cp "$DLL2" out/mods/Emberkeeper/
+            cp Emberkeeper-NoPck.json out/mods/Emberkeeper/Emberkeeper.json
+            echo "已回退精简版"
+          fi
+          ls -lh out/mods/Emberkeeper/
+          exit 0
+
+      - name: 准备 BaseLib 前置库
+        id: baselib
+        run: |
+          set +e
+          cd "$R"
+          mkdir -p out/mods/BaseLib
+          BL_ZIP=$(find /home/runner/work -maxdepth 4 -iname "*BaseLib*.zip" 2>/dev/null | head -1)
+          if [ -n "$BL_ZIP" ]; then
+            echo "仓库里找到 BaseLib 压缩包: $BL_ZIP"
+            mkdir -p /tmp/blz && unzip -o -q "$BL_ZIP" -d /tmp/blz
+            for ext in dll pck json; do
+              f=$(find /tmp/blz -iname "BaseLib.$ext" | head -1)
+              [ -n "$f" ] && cp "$f" out/mods/BaseLib/
+            done
+          else
+            for ext in dll pck json; do
+              f=$(find /home/runner/work -maxdepth 4 -iname "BaseLib.$ext" 2>/dev/null | head -1)
+              [ -n "$f" ] && cp "$f" out/mods/BaseLib/
+            done
+          fi
+          for ext in dll pck json; do
+            if [ ! -f "out/mods/BaseLib/BaseLib.$ext" ]; then
+              echo "缺 BaseLib.$ext → 从官方 v3.4.7 下载"
+              curl -sSL --max-time 120 -o "out/mods/BaseLib/BaseLib.$ext" \
+                "https://github.com/Alchyr/BaseLib-StS2/releases/download/v3.4.7/BaseLib.$ext"
+            fi
+          done
+          echo "=== BaseLib 三件套 ==="
+          ls -lh out/mods/BaseLib/
+          exit 0
+
+      - name: 成品一致性校验
+        run: |
+          set +e
+          cd "$R/out/mods"
+          echo "=== 安装包结构 ==="
+          find . -type f | sort
+          echo ""
+          for M in Emberkeeper BaseLib; do
+            PCK=$(ls $M/*.pck 2>/dev/null | wc -l)
+            HP=$(grep -o '"has_pck"[[:space:]]*:[[:space:]]*[a-z]*' $M/*.json 2>/dev/null | head -1)
+            echo "$M: pck数=$PCK  声明=$HP"
+          done
+          echo "✓ 校验完成"
+
+      - name: 打包完整安装包
+        run: |
+          cd "$R/out"
+          zip -r Emberkeeper-mod.zip mods
+          ls -lh Emberkeeper-mod.zip
+
+      - name: 写摘要
+        if: always()
+        run: |
+          {
+            echo "## 构建结果"
+            echo ""
+            echo "build：**${{ steps.build.outcome }}** / pck：**${{ steps.pck.outcome }}**"
+            echo ""
+            echo "下载 **Emberkeeper-mod.zip** → 解压 → 把里面的 BaseLib 和 Emberkeeper"
+            echo "两个文件夹一起丢进 Slay the Spire 2/mods/"
+            echo ""
+            echo '```'
+            grep -E "error" /tmp/log.txt 2>/dev/null | sort -u | head -40 || echo "(无错误)"
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: 上传成品
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Emberkeeper-mod
+          path: ${{ env.R }}/out/Emberkeeper-mod.zip
