@@ -1,0 +1,112 @@
+name: build
+on: [push, workflow_dispatch]
+
+jobs:
+  b:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: 全流程
+        run: |
+          set +e
+          W="$GITHUB_WORKSPACE"
+          R="$W/s/Emberkeeper"
+
+          echo "===== 1. 解压 ====="
+          cd "$W"
+          mkdir -p s && unzip -o -q Emberkeeper.zip -d s
+          echo "unzip=$?"
+          [ -f "$R/Emberkeeper.csproj" ] || R=$(dirname "$(find "$W/s" -name 'Emberkeeper.csproj' | head -1)")
+          echo "R=[$R]"
+
+          echo "===== 2. restore ====="
+          cd "$R"
+          dotnet restore -p:UseRefLib=true 2>&1 | tail -25
+          echo "restore=${PIPESTATUS[0]}"
+
+          echo "===== 3. build ====="
+          dotnet build -c Release --no-restore -p:UseRefLib=true 2>&1 | tail -40
+          echo "build=${PIPESTATUS[0]}"
+
+          echo "===== 4. 收 DLL ====="
+          mkdir -p "$W/dist/mods/Emberkeeper"
+          D=$(find "$R" -name "Emberkeeper.dll" -not -path "*/obj/*" | head -1)
+          echo "DLL=[$D]"
+          [ -n "$D" ] && cp "$D" "$W/dist/mods/Emberkeeper/"
+          cp "$R/Emberkeeper.json" "$W/dist/mods/Emberkeeper/"
+
+          echo "===== 5. Godot ====="
+          mkdir -p /tmp/gd && cd /tmp/gd
+          G=""
+          for U in \
+            "https://github.com/godotengine/godot/releases/download/4.5.1-stable/Godot_v4.5.1-stable_linux.x86_64.zip" \
+            "https://github.com/godotengine/godot/releases/download/4.5.1-stable/Godot_v4.5.1-stable_linux_x86_64.zip" ; do
+            rm -f g.zip
+            curl -sSL --max-time 300 -o g.zip "$U"
+            echo "  $(basename "$U") → $(stat -c%s g.zip 2>/dev/null || echo 0)"
+            [ "$(stat -c%s g.zip 2>/dev/null || echo 0)" -lt 1000000 ] && continue
+            unzip -q -o g.zip || continue
+            C=$(find . -maxdepth 1 -type f -iname "Godot*" ! -name "*.zip" | head -1)
+            [ -n "$C" ] && chmod +x "$C" && G="$(pwd)/$C" && break
+          done
+          echo "GODOT=[$G]"
+
+          echo "===== 6. 导出 PCK ====="
+          cd "$R"
+          OK=0
+          if [ -n "$G" ]; then
+            "$G" --headless --path . --import 2>&1 | tail -6
+            for P in BasicExport CustomExport MinimalExport; do
+              rm -f Emberkeeper.pck
+              "$G" --headless --path . --export-pack "$P" Emberkeeper.pck 2>&1 | tail -10
+              [ -s Emberkeeper.pck ] && echo "PCK=$P OK" && OK=1 && break
+            done
+          fi
+          if [ "$OK" = "1" ]; then
+            cp Emberkeeper.pck "$W/dist/mods/Emberkeeper/"
+            echo "→ 完整版"
+          else
+            echo "→ 回退精简版"
+            sed -i 's/UseCustomImages = true/UseCustomImages = false/' Scripts/Characters/EmberkeeperCharacter.cs
+            dotnet build -c Release --no-restore -p:UseRefLib=true 2>&1 | tail -10
+            D2=$(find "$R" -name "Emberkeeper.dll" -not -path "*/obj/*" | head -1)
+            [ -n "$D2" ] && cp "$D2" "$W/dist/mods/Emberkeeper/"
+            cp "$R/Emberkeeper-NoPck.json" "$W/dist/mods/Emberkeeper/Emberkeeper.json"
+          fi
+
+          echo "===== 7. BaseLib ====="
+          mkdir -p "$W/dist/mods/BaseLib"
+          for e in dll pck json; do
+            curl -sSL --max-time 180 -o "$W/dist/mods/BaseLib/BaseLib.$e" \
+              "https://github.com/Alchyr/BaseLib-StS2/releases/download/v3.4.7/BaseLib.$e"
+            echo "  BaseLib.$e → $(stat -c%s "$W/dist/mods/BaseLib/BaseLib.$e" 2>/dev/null || echo 0)"
+          done
+
+          echo "===== 8. 打包 ====="
+          cd "$W/dist"
+          zip -r -q Emberkeeper-mod.zip mods
+          echo "zip=$?"
+          find mods -type f | sort
+          echo "--- dist 目录 ---"
+          ls -lh "$W/dist"
+          exit 0
+
+      - name: 上传 zip
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Emberkeeper-mod
+          path: ${{ github.workspace }}/dist/Emberkeeper-mod.zip
+          if-no-files-found: warn
+
+      - name: 上传整个目录（备份）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Emberkeeper-mods-folder
+          path: ${{ github.workspace }}/dist/mods/
+          if-no-files-found: warn
