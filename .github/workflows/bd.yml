@@ -1,0 +1,105 @@
+name: build
+on: [push, workflow_dispatch]
+
+jobs:
+  b:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: 解压
+        id: prep
+        run: |
+          mkdir -p s
+          if [ -f Emberkeeper.zip ]; then unzip -o -q Emberkeeper.zip -d s; else cp -r . s/cur 2>/dev/null || true; fi
+          if [ -f s/Emberkeeper/Emberkeeper.csproj ]; then R=s/Emberkeeper
+          elif [ -f s/Emberkeeper.csproj ]; then R=s
+          else R=$(dirname "$(find s -name 'Emberkeeper.csproj' | head -1)"); fi
+          echo "R=$R" >> $GITHUB_ENV
+          echo "源码根：$R"
+
+      - name: 探测 API（先看这个）
+        id: probe
+        continue-on-error: true
+        run: |
+          cd "$R"
+          dotnet restore -p:UseRefLib=true >/dev/null 2>&1
+          echo "=== 已还原的包 ==="
+          ls ~/.nuget/packages/ | grep -iE "sts2|baselib" || true
+          echo ""
+          for d in ~/.nuget/packages/lamali.sts2.reflib/*/ ~/.nuget/packages/alchyr.sts2.baselib/*/; do
+            echo "版本目录：$d"
+          done
+          echo ""
+          STS2=$(find ~/.nuget/packages -iname "sts2.dll" | head -1)
+          BL=$(find ~/.nuget/packages -iname "BaseLib.dll" | head -1)
+          echo "sts2.dll  = $STS2"
+          echo "BaseLib   = $BL"
+          echo ""
+          echo "===== [A] sts2 里所有含 Entities/Models/Characters 的命名空间 ====="
+          strings "$STS2" | grep -oE "MegaCrit\.Sts2\.Core\.(Entities|Models)\.[A-Za-z0-9_.]*" | sort -u | head -80
+          echo ""
+          echo "===== [B] sts2 里所有 TurnStart 相关标识符 ====="
+          strings "$STS2" | grep -E "TurnStart" | sort -u | head -40
+          echo ""
+          echo "===== [C] sts2 里 CharacterGender ====="
+          strings "$STS2" | grep -oE "MegaCrit[A-Za-z0-9_.]*CharacterGender" | sort -u | head
+          echo ""
+          echo "===== [D] BaseLib 命名空间 ====="
+          strings "$BL" | grep -oE "BaseLib\.[A-Za-z0-9_.]*" | sort -u | head -60
+          echo ""
+          echo "===== [E] BaseLib 里 Pool 相关类型 ====="
+          strings "$BL" | grep -iE "pool" | sort -u | head -60
+          echo ""
+          echo "===== [F] BaseLib 里 Custom* 类型 ====="
+          strings "$BL" | grep -oE "Custom[A-Za-z0-9_]*" | sort -u | head -60
+
+      - name: 编译
+        id: build
+        continue-on-error: true
+        run: |
+          cd "$R"
+          echo "=== build ===" > /tmp/log.txt
+          dotnet build -c Release --no-restore -p:UseRefLib=true >> /tmp/log.txt 2>&1
+          echo "build exit=$?" >> /tmp/log.txt
+          grep -E "error" /tmp/log.txt | sort -u | head -40 || true
+
+      - name: 导出 PCK
+        id: pck
+        continue-on-error: true
+        run: |
+          cd "$R"
+          mkdir -p out/Emberkeeper
+          DLL=$(find . -name "Emberkeeper.dll" -not -path "*/obj/*" | head -1)
+          if [ -n "$DLL" ]; then cp "$DLL" out/Emberkeeper/; cp Emberkeeper.json out/Emberkeeper/; echo "DLL 已产出"; fi
+          cd /tmp
+          curl -sSL -o g.zip https://github.com/godotengine/godot/releases/download/4.5.1-stable/Godot_v4.5.1-stable_linux_x86_64.zip
+          unzip -q -o g.zip; mv Godot_v4.5.1-stable_linux_x86_64 gb 2>/dev/null || true; chmod +x gb
+          cd "$R"
+          mkdir -p .h && [ -d Code ] && mv Code .h/ ; [ -f Emberkeeper.csproj ] && mv Emberkeeper.csproj .h/
+          /tmp/gb --headless --export-pack "BasicExport" Emberkeeper.pck 2>&1 | tail -10
+          [ -d .h/Code ] && mv .h/Code Code ; [ -f .h/Emberkeeper.csproj ] && mv .h/Emberkeeper.csproj Emberkeeper.csproj
+          if [ -f Emberkeeper.pck ]; then cp Emberkeeper.pck out/Emberkeeper/; echo "PCK OK";
+          else cp Emberkeeper-NoPck.json out/Emberkeeper/Emberkeeper.json; echo "PCK 失败，退回精简版"; fi
+          ls -lh out/Emberkeeper/
+
+      - name: 写摘要
+        if: always()
+        run: |
+          {
+            echo "## 构建结果  build=${{ steps.build.outcome }}  pck=${{ steps.pck.outcome }}"
+            echo '```'
+            grep -E "error" /tmp/log.txt 2>/dev/null | sort -u | head -40 || echo "(无错误)"
+            echo '```'
+            echo "> 把上面和「探测 API」步骤的输出一起发给 AI。"
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: 上传成品
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Emberkeeper-mod
+          path: ${{ env.R }}/out/Emberkeeper
