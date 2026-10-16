@@ -1,0 +1,131 @@
+name: build
+on: [push, workflow_dispatch]
+
+# 产物：Emberkeeper-mod.zip
+# 解压后得到 mods/BaseLib + mods/Emberkeeper，一起丢进游戏 mods/ 即可。
+
+jobs:
+  b:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: 解压 + 版本校验
+        run: |
+          mkdir -p s
+          echo "=== zip 校验码（确认是不是最新版）==="
+          md5sum Emberkeeper.zip
+          unzip -o -q Emberkeeper.zip -d s
+          R=$(dirname "$(find s -name 'Emberkeeper.csproj' | head -1)")
+          echo "R=$R" >> $GITHUB_ENV
+          echo "源码根：$R"
+          echo "脚本数: $(find "$R/Scripts" -name '*.cs' | wc -l)（应为 7）"
+          echo "贴图数: $(find "$R/Emberkeeper/images" -type f | wc -l)（应为 12）"
+          grep -n "UseCustomImages = " "$R/Scripts/Characters/EmberkeeperCharacter.cs"
+          echo "预设名: $(grep -h '^name=' "$R/export_presets.cfg" | tr '\n' ' ')"
+
+      - name: 还原依赖
+        run: |
+          cd "$R"
+          dotnet restore -p:UseRefLib=true 2>&1 | tail -8
+
+      - name: 探测 API 签名
+        id: probe
+        continue-on-error: true
+        run: |
+          cd "$R/tools/probe"
+          dotnet run -c Release 2>&1 | tail -120
+
+      - name: 编译
+        id: build
+        continue-on-error: true
+        run: |
+          cd "$R"
+          echo "=== build ===" > /tmp/log.txt
+          dotnet build -c Release --no-restore -p:UseRefLib=true >> /tmp/log.txt 2>&1
+          echo "build exit=$?" >> /tmp/log.txt
+          grep -E "error" /tmp/log.txt | sort -u | head -60 || echo "(无错误)"
+
+      - name: 导出 PCK
+        id: pck
+        continue-on-error: true
+        run: |
+          set +e
+          cd "$R"
+          mkdir -p out/mods/Emberkeeper
+          D=$(find . -name "Emberkeeper.dll" -not -path "*/obj/*" | head -1)
+          if [ -n "$D" ]; then cp "$D" out/mods/Emberkeeper/; cp Emberkeeper.json out/mods/Emberkeeper/; fi
+
+          # Godot 4.5.1（真实文件名 linux.x86_64 用点分隔；解压后用 glob 定位，不猜名字）
+          mkdir -p /tmp/gd && cd /tmp/gd
+          G=""
+          for U in \
+            "https://github.com/godotengine/godot/releases/download/4.5.1-stable/Godot_v4.5.1-stable_linux.x86_64.zip" \
+            "https://github.com/godotengine/godot/releases/download/4.5.1-stable/Godot_v4.5.1-stable_linux_x86_64.zip" ; do
+            rm -f g.zip
+            curl -sSL --max-time 300 -o g.zip "$U" || continue
+            [ "$(stat -c%s g.zip 2>/dev/null || echo 0)" -lt 1000000 ] && continue
+            unzip -q -o g.zip || continue
+            C=$(find . -maxdepth 1 -type f -iname "Godot*" ! -name "*.zip" | head -1)
+            [ -n "$C" ] && chmod +x "$C" && G="$(pwd)/$C" && break
+          done
+          echo "Godot=$G"
+          [ -n "$G" ] && "$G" --headless --version 2>&1 | head -2
+
+          cd "$R"
+          OK=0
+          if [ -n "$G" ]; then
+            echo "=== 导入资源 ==="
+            "$G" --headless --path . --import 2>&1 | tail -8
+            for P in BasicExport CustomExport MinimalExport; do
+              echo "--- 预设 $P ---"
+              rm -f Emberkeeper.pck
+              "$G" --headless --path . --export-pack "$P" Emberkeeper.pck 2>&1 | tail -12
+              [ -s Emberkeeper.pck ] && echo "✔ $P 成功" && OK=1 && break
+            done
+          fi
+
+          echo "===== PCK 结果 ====="
+          if [ "$OK" = "1" ]; then
+            cp Emberkeeper.pck out/mods/Emberkeeper/
+            echo "✔ PCK OK → 完整版（自定义贴图生效）"
+          else
+            echo "⚠ PCK 失败 → 回退精简版（全部沿用 silent 原版美术）"
+            sed -i 's/UseCustomImages = true/UseCustomImages = false/' Scripts/Characters/EmberkeeperCharacter.cs
+            grep -n "UseCustomImages = " Scripts/Characters/EmberkeeperCharacter.cs
+            dotnet build -c Release --no-restore -p:UseRefLib=true 2>&1 | tail -8
+            D2=$(find . -name "Emberkeeper.dll" -not -path "*/obj/*" | head -1)
+            [ -n "$D2" ] && cp "$D2" out/mods/Emberkeeper/
+            cp Emberkeeper-NoPck.json out/mods/Emberkeeper/Emberkeeper.json
+          fi
+
+          # BaseLib 前置库（缺哪个从官方 v3.4.7 补，保证 pck 一定在）
+          mkdir -p out/mods/BaseLib
+          for e in dll pck json; do
+            [ -f "out/mods/BaseLib/BaseLib.$e" ] || curl -sSL --max-time 180 \
+              -o "out/mods/BaseLib/BaseLib.$e" \
+              "https://github.com/Alchyr/BaseLib-StS2/releases/download/v3.4.7/BaseLib.$e"
+          done
+
+          # 一致性校验：pck 数量必须和清单声明一致
+          cd out/mods
+          for M in Emberkeeper BaseLib; do
+            N=$(ls $M/*.pck 2>/dev/null | wc -l)
+            H=$(grep -o '"has_pck"[^,}]*' $M/*.json | head -1)
+            echo "$M: pck数=$N  声明=$H"
+          done
+          cd .. && zip -r -q Emberkeeper-mod.zip mods
+          echo "===== 成品 ====="
+          find mods -type f | sort
+          ls -lh Emberkeeper-mod.zip
+          exit 0
+
+      - name: 上传成品
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Emberkeeper-mod
+          path: ${{ env.R }}/out/Emberkeeper-mod.zip
