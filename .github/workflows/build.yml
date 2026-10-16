@@ -1,0 +1,94 @@
+name: build
+on: [push, workflow_dispatch]
+
+jobs:
+  b:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: 解压并体检
+        id: prep
+        run: |
+          mkdir -p s
+          if [ -f Emberkeeper.zip ]; then
+            unzip -o -q Emberkeeper.zip -d s
+          else
+            cp -r . s/cur 2>/dev/null || true
+          fi
+          echo "=== zip 顶层 ==="
+          ls s/
+          echo "=== 找 csproj ==="
+          find s -name "*.csproj" | head
+          echo "=== 找 ci-build.sh ==="
+          find s -name "ci-build.sh" | head
+          if [ -f s/Emberkeeper/Emberkeeper.csproj ]; then R=s/Emberkeeper
+          elif [ -f s/Emberkeeper.csproj ]; then R=s
+          else R=$(dirname "$(find s -name 'Emberkeeper.csproj' | head -1)"); fi
+          echo "源码根：$R"
+          echo "R=$R" >> $GITHUB_ENV
+
+      - name: 编译
+        id: build
+        continue-on-error: true
+        run: |
+          cd "$R"
+          echo "=== restore ===" 2>&1 | tee /tmp/log.txt
+          dotnet restore -p:UseRefLib=true >> /tmp/log.txt 2>&1
+          echo "restore exit=$?" >> /tmp/log.txt
+          echo "=== build ===" >> /tmp/log.txt
+          dotnet build -c Release --no-restore -p:UseRefLib=true >> /tmp/log.txt 2>&1
+          echo "build exit=$?" >> /tmp/log.txt
+          tail -80 /tmp/log.txt
+
+      - name: 导出 PCK
+        id: pck
+        continue-on-error: true
+        run: |
+          cd "$R"
+          mkdir -p out/Emberkeeper
+          DLL=$(find . -name "Emberkeeper.dll" -not -path "*/obj/*" | head -1)
+          if [ -n "$DLL" ]; then
+            cp "$DLL" out/Emberkeeper/
+            cp Emberkeeper.json out/Emberkeeper/
+            echo "DLL 已产出"
+          fi
+          cd /tmp
+          curl -sSL -o g.zip https://github.com/godotengine/godot/releases/download/4.5.1-stable/Godot_v4.5.1-stable_linux_x86_64.zip
+          unzip -q -o g.zip
+          mv Godot_v4.5.1-stable_linux_x86_64 gb 2>/dev/null || true
+          chmod +x gb
+          cd "$R"
+          mkdir -p .h && [ -d Code ] && mv Code .h/ ; [ -f Emberkeeper.csproj ] && mv Emberkeeper.csproj .h/
+          /tmp/gb --headless --export-pack "BasicExport" Emberkeeper.pck 2>&1 | tail -10
+          [ -d .h/Code ] && mv .h/Code Code ; [ -f .h/Emberkeeper.csproj ] && mv .h/Emberkeeper.csproj Emberkeeper.csproj
+          if [ -f Emberkeeper.pck ]; then cp Emberkeeper.pck out/Emberkeeper/; echo "PCK OK";
+          else cp Emberkeeper-NoPck.json out/Emberkeeper/Emberkeeper.json; echo "PCK 失败，退回精简版"; fi
+          ls -lh out/Emberkeeper/
+
+      - name: 写诊断摘要
+        if: always()
+        run: |
+          {
+            echo "## 构建结果"
+            echo ""
+            echo "build 步骤结论：**${{ steps.build.outcome }}**"
+            echo "pck 步骤结论：**${{ steps.pck.outcome }}**"
+            echo ""
+            echo "### 错误日志（最后 100 行）"
+            echo '```'
+            tail -100 /tmp/log.txt 2>/dev/null || echo "(无日志)"
+            echo '```'
+            echo ""
+            echo "> 如果上面是红的，长按复制这段报错发给 AI 即可定位。"
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: 上传成品
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Emberkeeper-mod
+          path: ${{ env.R }}/out/Emberkeeper
