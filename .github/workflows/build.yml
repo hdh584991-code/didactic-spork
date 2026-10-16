@@ -1,0 +1,92 @@
+name: build
+on: [push, workflow_dispatch]
+
+jobs:
+  b:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: 解压 + 版本校验
+        run: |
+          mkdir -p s
+          echo "=== zip 校验码（确认是不是最新版）==="
+          md5sum Emberkeeper.zip
+          unzip -o -q Emberkeeper.zip -d s
+          if [ -f s/Emberkeeper/Emberkeeper.csproj ]; then R=s/Emberkeeper
+          elif [ -f s/Emberkeeper.csproj ]; then R=s
+          else R=$(dirname "$(find s -name 'Emberkeeper.csproj' | head -1)"); fi
+          echo "R=$R" >> $GITHUB_ENV
+          echo "源码根：$R"
+          echo ""
+          echo "=== 美术开关（true=用自定义贴图，false=借用原版角色）==="
+          grep -n "UseCustomArt = " "$R/Code/Characters/EmberkeeperCharacter.cs"
+          echo ""
+          echo "=== 贴图数量（应有 12 个）==="
+          find "$R/Emberkeeper/images" -type f | wc -l
+
+      - name: 还原依赖
+        run: |
+          cd "$R"
+          dotnet restore -p:UseRefLib=true 2>&1 | tail -8
+
+      - name: 探测 API 签名（用于补回余烬转化）
+        id: probe
+        continue-on-error: true
+        run: |
+          cd "$R/tools/probe"
+          dotnet run -c Release 2>&1 | tail -60
+
+      - name: 编译
+        id: build
+        continue-on-error: true
+        run: |
+          cd "$R"
+          echo "=== build ===" > /tmp/log.txt
+          dotnet build -c Release --no-restore -p:UseRefLib=true >> /tmp/log.txt 2>&1
+          echo "build exit=$?" >> /tmp/log.txt
+          echo "===== 全部错误 ====="
+          grep -E "error" /tmp/log.txt | sort -u | head -60 || echo "(无错误)"
+
+      - name: 导出 PCK
+        id: pck
+        continue-on-error: true
+        run: |
+          cd "$R"
+          mkdir -p out/Emberkeeper
+          DLL=$(find . -name "Emberkeeper.dll" -not -path "*/obj/*" | head -1)
+          if [ -n "$DLL" ]; then cp "$DLL" out/Emberkeeper/; cp Emberkeeper.json out/Emberkeeper/; echo "DLL 已产出"; fi
+          cd /tmp
+          curl -sSL -o g.zip https://github.com/godotengine/godot/releases/download/4.5.1-stable/Godot_v4.5.1-stable_linux_x86_64.zip
+          unzip -q -o g.zip; mv Godot_v4.5.1-stable_linux_x86_64 gb 2>/dev/null || true; chmod +x gb
+          cd "$R"
+          mkdir -p .h && [ -d Code ] && mv Code .h/ ; [ -f Emberkeeper.csproj ] && mv Emberkeeper.csproj .h/
+          /tmp/gb --headless --export-pack "BasicExport" Emberkeeper.pck 2>&1 | tail -10
+          [ -d .h/Code ] && mv .h/Code Code ; [ -f .h/Emberkeeper.csproj ] && mv .h/Emberkeeper.csproj Emberkeeper.csproj
+          if [ -f Emberkeeper.pck ]; then cp Emberkeeper.pck out/Emberkeeper/; echo "PCK OK";
+          else cp Emberkeeper-NoPck.json out/Emberkeeper/Emberkeeper.json; echo "PCK 失败，退回精简版"; fi
+          ls -lh out/Emberkeeper/
+
+      - name: 写摘要
+        if: always()
+        run: |
+          {
+            echo "## 构建结果"
+            echo ""
+            echo "build 步骤：**${{ steps.build.outcome }}**"
+            echo "pck 步骤：**${{ steps.pck.outcome }}**"
+            echo ""
+            echo '```'
+            grep -E "error" /tmp/log.txt 2>/dev/null | sort -u | head -40 || echo "(无错误)"
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: 上传成品
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Emberkeeper-mod
+          path: ${{ env.R }}/out/Emberkeeper
