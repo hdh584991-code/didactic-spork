@@ -1,0 +1,129 @@
+name: build
+on: [push, workflow_dispatch]
+
+jobs:
+  b:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: 解压
+        run: |
+          mkdir -p s
+          if [ -f Emberkeeper.zip ]; then unzip -o -q Emberkeeper.zip -d s; else cp -r . s/cur 2>/dev/null || true; fi
+          if [ -f s/Emberkeeper/Emberkeeper.csproj ]; then R=s/Emberkeeper
+          elif [ -f s/Emberkeeper.csproj ]; then R=s
+          else R=$(dirname "$(find s -name 'Emberkeeper.csproj' | head -1)"); fi
+          echo "R=$R" >> $GITHUB_ENV
+          echo "源码根：$R"
+
+      - name: 还原依赖
+        run: |
+          cd "$R"
+          dotnet restore -p:UseRefLib=true 2>&1 | tail -10
+          echo "=== 实际还原的版本 ==="
+          ls ~/.nuget/packages/lamali.sts2.reflib/ 2>/dev/null || true
+          ls ~/.nuget/packages/alchyr.sts2.baselib/ 2>/dev/null || true
+
+      # ── 反射探测：把真实的 API 签名打印出来 ──────────────────
+      - name: 探测 PowerModel 钩子
+        id: probe
+        continue-on-error: true
+        run: |
+          mkdir -p /tmp/probe && cd /tmp/probe
+          cat > probe.csproj <<'EOF'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType>
+              <TargetFramework>net9.0</TargetFramework>
+              <Nullable>disable</Nullable>
+              <AssemblyName>probe</AssemblyName>
+            </PropertyGroup>
+            <ItemGroup>
+              <PackageReference Include="lamali.StS2.RefLib" Version="0.111.0-beta" />
+              <PackageReference Include="Alchyr.Sts2.BaseLib" Version="3.*" />
+            </ItemGroup>
+          </Project>
+          EOF
+          cat > Program.cs <<'EOF'
+          using System;using System.Linq;using System.Reflection;
+          class P{static void Main(){
+            void Dump(Type t,string tag){
+              Console.WriteLine($"===== {tag} : {t.FullName} =====");
+              if(t==null){Console.WriteLine("(未找到)");return;}
+              foreach(var m in t.GetMethods(BindingFlags.Public|BindingFlags.NonPublic|BindingFlags.Instance)
+                               .Where(m=>m.IsVirtual&&!m.IsSpecialName)
+                               .OrderBy(m=>m.Name)){
+                if(!m.Name.Contains("Turn")&&!m.Name.Contains("Owner"))continue;
+                var ps=string.Join(", ",m.GetParameters().Select(p=>p.ParameterType.Name+" "+p.Name));
+                Console.WriteLine($"{m.ReturnType.Name} {m.Name}({ps})");
+              }
+              Console.WriteLine("--- 属性 ---");
+              foreach(var p in t.GetProperties(BindingFlags.Public|BindingFlags.Instance).OrderBy(x=>x.Name))
+                Console.WriteLine($"{p.PropertyType.Name} {p.Name}");
+            }
+            var sts2=Assembly.Load("sts2");
+            var pm=sts2.GetType("MegaCrit.Sts2.Core.Models.PowerModel");
+            Dump(pm,"PowerModel");
+            var bl=Assembly.Load("BaseLib");
+            var cpm=bl.GetType("BaseLib.Abstracts.CustomPowerModel");
+            Dump(cpm,"CustomPowerModel");
+            Console.WriteLine("===== PowerCmd 方法 =====");
+            var pc=sts2.GetType("MegaCrit.Sts2.Core.Commands.PowerCmd");
+            if(pc!=null)foreach(var m in pc.GetMethods(BindingFlags.Public|BindingFlags.Static))
+              Console.WriteLine($"{m.ReturnType.Name} {m.Name}({string.Join(", ",m.GetParameters().Select(p=>p.ParameterType.Name))})");
+            Console.WriteLine("===== BaseLib 里所有 Attribute =====");
+            foreach(var t in bl.GetTypes().Where(t=>typeof(Attribute).IsAssignableFrom(t)))
+              Console.WriteLine(t.FullName);
+          }}
+          EOF
+          dotnet run -c Release 2>&1 | tail -120
+
+      - name: 编译
+        id: build
+        continue-on-error: true
+        run: |
+          cd "$R"
+          echo "=== build ===" > /tmp/log.txt
+          dotnet build -c Release --no-restore -p:UseRefLib=true >> /tmp/log.txt 2>&1
+          echo "build exit=$?" >> /tmp/log.txt
+          grep -E "error" /tmp/log.txt | sort -u | head -30 || echo "(无错误)"
+
+      - name: 导出 PCK
+        id: pck
+        continue-on-error: true
+        run: |
+          cd "$R"
+          mkdir -p out/Emberkeeper
+          DLL=$(find . -name "Emberkeeper.dll" -not -path "*/obj/*" | head -1)
+          if [ -n "$DLL" ]; then cp "$DLL" out/Emberkeeper/; cp Emberkeeper.json out/Emberkeeper/; echo "DLL 已产出"; fi
+          cd /tmp
+          curl -sSL -o g.zip https://github.com/godotengine/godot/releases/download/4.5.1-stable/Godot_v4.5.1-stable_linux_x86_64.zip
+          unzip -q -o g.zip; mv Godot_v4.5.1-stable_linux_x86_64 gb 2>/dev/null || true; chmod +x gb
+          cd "$R"
+          mkdir -p .h && [ -d Code ] && mv Code .h/ ; [ -f Emberkeeper.csproj ] && mv Emberkeeper.csproj .h/
+          /tmp/gb --headless --export-pack "BasicExport" Emberkeeper.pck 2>&1 | tail -10
+          [ -d .h/Code ] && mv .h/Code Code ; [ -f .h/Emberkeeper.csproj ] && mv .h/Emberkeeper.csproj Emberkeeper.csproj
+          if [ -f Emberkeeper.pck ]; then cp Emberkeeper.pck out/Emberkeeper/; echo "PCK OK";
+          else cp Emberkeeper-NoPck.json out/Emberkeeper/Emberkeeper.json; echo "PCK 失败，退回精简版"; fi
+          ls -lh out/Emberkeeper/
+
+      - name: 写摘要
+        if: always()
+        run: |
+          {
+            echo "## 结果  build=${{ steps.build.outcome }}  pck=${{ steps.pck.outcome }}"
+            echo '```'
+            grep -E "error" /tmp/log.txt 2>/dev/null | sort -u | head -30 || echo "(无错误)"
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: 上传成品
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Emberkeeper-mod
+          path: ${{ env.R }}/out/Emberkeeper
